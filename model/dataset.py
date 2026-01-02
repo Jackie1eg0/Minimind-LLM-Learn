@@ -15,40 +15,60 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 class PretrainDataset(Dataset):
     def __init__(self, data_path, tokenizer, max_length=512):
+    # tokenizer:分词器,用于将文本转换为Token ID
+    # tokenizer是tokenizer = AutoTokenizer.from_pretrained('./model/minimind_tokenizer')从本地加载的分词器
+    # 本地的minimind_tokenizer文件夹包含以下内容：
+    #           1、vocab.json 词汇表 2、merges.txt合并规则
+    #           3、tokenizer_config.json 定义特殊Token与Token ID映射如: O对于<unk> 1对于<BOS> 2对应<EOS>
+    #           4、tokenizer.json BPE分词算法得到的Token到Token ID的映射关系
+    
+    # max_length:每一条样本的最大Token长度
         super().__init__()
-        self.tokenizer = tokenizer
+        self.tokenizer = tokenizer  
         self.max_length = max_length
-        self.samples = self.load_data(data_path)
+        self.samples = self.load_data(data_path)    # 从指定的文件夹加载Pretrain_hq.jsonl文件
 
     def load_data(self, path):
+        # 从jsonl文件中加载数据,每一行为一条jsonl格式的样本
         samples = []
         with open(path, 'r', encoding='utf-8') as f:
             for line_num, line in enumerate(f, 1):
+                # 读取每一行,解析成字典结构从Pretrain_hq.jsonl某一行看
+                # key是"text" 而value是用于训练的文本,包含多个Q&A 以<|im_start|>和<|im_end|>作为不同Q&A分隔
                 data = json.loads(line.strip())
                 samples.append(data)
         return samples
 
     def __len__(self):
+        # 返回训练的样本数量,每一行的jsonl可以看作是一个样本。
         return len(self.samples)
 
     def __getitem__(self, index):
         sample = self.samples[index]
-
-        # 构建输入文本
+        # 返回第index个的样本(一个sample中包含多个Q&A问答)
+        # 在多个Q&A问答的前后加上<BOS> <EOS> 当作一个Sequence
+        # 只不过Input包含多个Q&A问答，不同的Q&A问答使用<|im_start|>和<|im_end|>分割,给模型一次训练就喂多个Q&A最大化利用Context Windows
         text = f"{self.tokenizer.bos_token}{str(sample['text'])}{self.tokenizer.eos_token}"
+        # 经过Tokenization把Token映射为Token ID
         encoding = self.tokenizer(
-            text,
-            max_length=self.max_length,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
+            text,                       # 上文提取的Input Sequence 包含多个Q&A问答
+            max_length=self.max_length, # 限制最大的Token长度
+            padding='max_length',       
+            truncation=True,            # 对超出部分进行截断True
+            return_tensors='pt'         # 返回Pytorch tensor形式
         )
+        # 获得input_ids张量,并去除batch维度
         input_ids = encoding.input_ids.squeeze()
+        # 创建一个loss_mask掩码去mask掉<pad>部分,在计算损失函数不计算<pad>的损失
         loss_mask = (input_ids != self.tokenizer.pad_token_id)
 
+        # Minimind是自回归的,预测得到的下一个Token会作为新一轮的输入,再去预测下一个Token
+        # 假设在做切片时候,input_ids是[BOS A B C EOS]
+        # 那么X是训练时候的输入[BOS A B C],Y是输出的真实标签[A B C EOS],用于训练时与模型的输出做Loss损失计算
         X = torch.tensor(input_ids[:-1], dtype=torch.long)
         Y = torch.tensor(input_ids[1:], dtype=torch.long)
         loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)
+        # 返回训练的输入X [BOS A B C ] 真实标签Y [A B C EOS] 以及计算Loss Function的Mask掩码(忽略<Pad>) 
         return X, Y, loss_mask
 
 

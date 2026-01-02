@@ -282,7 +282,7 @@ class MiniMindBlock(nn.Module):
         out = h + self.feed_forward(self.ffn_norm(h))
         return out, past_kv
 
-
+# MiniMind架构的核心部分
 class MiniMindLM(PreTrainedModel):
     config_class = LMConfig
 
