@@ -149,6 +149,7 @@ def init_distributed_mode():
 
 # torchrun --nproc_per_node 2 1-pretrain.py
 if __name__ == "__main__":
+    # 为Pretrain预训练设置相应的参数
     parser = argparse.ArgumentParser(description="MiniMind Pretraining")
     parser.add_argument("--out_dir", type=str, default="out")
     # 若要以最快速度实现zero则epochs设置为1轮；否则应当利用有限的数据训练2~6个epochs。
@@ -173,7 +174,8 @@ if __name__ == "__main__":
     parser.add_argument('--use_moe', default=False, type=bool)
     parser.add_argument("--data_path", type=str, default="./dataset/pretrain_hq.jsonl")
     args = parser.parse_args()
-
+    
+    # LMConfig类存储训练的参数
     lm_config = LMConfig(dim=args.dim, n_layers=args.n_layers, max_seq_len=args.max_seq_len, use_moe=args.use_moe)
     args.save_dir = os.path.join(args.out_dir)
     os.makedirs(args.save_dir, exist_ok=True)

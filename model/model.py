@@ -12,41 +12,68 @@ from torch import nn
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-
+# RMSNorm在Llama训练中使用到,传统的Transformer中使用的是LayerNorm
+# 相比传统的Norm少了均值相关计算,因为RMSNorm作者发现在LayerNorm中减去均值这步没什么用
+# LayerNorm能起作用主要是因为它把数据的缩放统一,与数据是否中心化无关
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
+        # dim为Embedding向量的维度512维,eps为一个极小的数,防止分母为0,
+        # self.weight是可学习的参数,对应于RMSNorm公式中的缩放因子γ
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
     def _norm(self, x):
+        # 按照RMSNorm计算公式,得到RMS(X) --> sqrt(X_i的平方取均值+eps)
+        # 注意此处使用的是X*rsqrt(y)=X/sqrt(y),得到均方根的倒数,主要为了高效计算
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
+        # 按照RMSNorm：x*(1/RMS(X))*缩放因子γ = RMSNorm(X)
         return self.weight * self._norm(x.float()).type_as(x)
 
+# Minimind采用主流的相对位置编码Rope,而不是传统Transformer使用的绝对位置编码
+# 在绝对位置编码中,模型只能感知每个Token Embedding所处的绝对位置,每一个位置都有一个固定的位置编码向量,Embedding之后的Vector与其相加
+# 绝对位置编码无法感知Embedding向量之间的相对位置
+# RoPE相对位置编码,出发点为：通过绝对位置编码实现相对位置编码,RoPE希望q在m位置处 与 k在n位置处 的内积可以携带m n位置的相对信息m-n
+# 参考链接:[RoPE编码后的向量内积如何包含相对位置(m-n)信息]https://www.bilibili.com/video/BV1T2k6BaEeC?p=8&vd_source=58cd116d4f3727402e47dc3abb530e6d
+# 以及：https://zhuanlan.zhihu.com/p/667864459
+# RoPE对于高维的Embedding向量,两两一组,分别进行旋转,旋转矩阵Rm是分块对角矩阵,m是Embedding Vector的位置m,theta_i是旋转的角度,同一个Token,高维度Vector两两分组,每组分配theta_i
+# 【大白话讲明白RoPE旋转位置编码】https://www.bilibili.com/video/BV1LbynBFEox?vd_source=58cd116d4f3727402e47dc3abb530e6d
 
+# 1、预先计算好所有可能位置(Position)对应的旋转角度(复数形式)
 def precompute_pos_cis(dim: int, end: int = int(32 * 1024), theta: float = 1e6):
+    # 1.1 计算频率 theta_i = 1/ (base^(2i/dim))
+    # 若一个Token Embedding成512维,那么这个512维的向量两两成组,第i组的对应theta_i为 1/(base**(2i/dim))
+    # torch.arange(0, dim, 2),生成2i的序列:[0, 2, 4, ..., dim-2]
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()  # type: ignore
+   
+    # 1.2 生成Token索引序列[0, 1, 2, ..., end],相当于公式的m序列,为从第0到第end个Token生成序列索引
+    t = torch.arange(end, device=freqs.device)
+    # 1.3 计算每一个位置的旋转角度,m * theta_i
+    freqs = torch.outer(t, freqs).float()
+    # 1.4 转为复数形式,模长为1，角度为e^(m*theta_i)  
     pos_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return pos_cis
 
-
+# 2、执行旋转
 def apply_rotary_emb(xq, xk, pos_cis):
+    # 辅助函数,用于把 pos_cis 的形状调整得和 xq 一样，方便广播(Broadcast)
     def unite_shape(pos_cis, x):
         ndim = x.ndim
         assert 0 <= 1 < ndim
         assert pos_cis.shape == (x.shape[1], x.shape[-1])
         shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
         return pos_cis.view(*shape)
-
+    # 实数转复数
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    # 形状对齐
     pos_cis = unite_shape(pos_cis, xq_)
+    # 复数乘法=旋转
     xq_out = torch.view_as_real(xq_ * pos_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * pos_cis).flatten(3)
+    # 转回实数并恢复类型
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
@@ -284,16 +311,24 @@ class MiniMindBlock(nn.Module):
 
 # MiniMind架构的核心部分
 class MiniMindLM(PreTrainedModel):
+    # LMConfig实例化Minimind的参数配置
     config_class = LMConfig
 
     def __init__(self, params: LMConfig = None):
         self.params = params or LMConfig()
         super().__init__(self.params)
+        # vocab_size为词表中的Token个数,可用于构建Embedding矩阵(vocab_size,d_embed)
+        # n_layer是MiniMindBlock的层数
         self.vocab_size, self.n_layers = params.vocab_size, params.n_layers
+        # 构建Embedding矩阵
         self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
         self.dropout = nn.Dropout(params.dropout)
+        # 构建n_layers层的MiniMindBlock
         self.layers = nn.ModuleList([MiniMindBlock(l, params) for l in range(self.n_layers)])
+        # MiniMind采用RMSNorm
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+        # 最后把经过Decoder得到的词向量矩阵从d_embed维度 -> vocab_size维度,以实现每一个Token的logits(分数计算)
+        # 再进过SoftMax层可以得到Vocab_size大小的Token概率
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
         self.tok_embeddings.weight = self.output.weight
         self.register_buffer("pos_cis",
@@ -307,6 +342,7 @@ class MiniMindLM(PreTrainedModel):
                 use_cache: bool = False,
                 logits_to_keep: Union[int, torch.Tensor] = 0,
                 **args):
+        
         past_key_values = past_key_values or [None] * len(self.layers)
         start_pos = args.get('start_pos', 0)
         h = self.dropout(self.tok_embeddings(input_ids))

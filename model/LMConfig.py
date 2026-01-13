@@ -7,16 +7,18 @@ class LMConfig(PretrainedConfig):
 
     def __init__(
             self,
-            dim: int = 512,
-            n_layers: int = 8,
-            n_heads: int = 8,
-            n_kv_heads: int = 2,
-            vocab_size: int = 6400,
+            dim: int = 512,         # Embedding的维度
+            n_layers: int = 8,      # Transformer Block的层数
+
+            n_heads: int = 8,       # Q的heads数
+            n_kv_heads: int = 2,    # K V的heads数,n_heads != n_kv_heads则说明其使用了GQA技术
+            
+            vocab_size: int = 6400, # 词表中的Token个数
             hidden_dim: int = None,
             multiple_of: int = 64,
             norm_eps: float = 1e-5,
-            max_seq_len: int = 8192,
-            rope_theta: int = 1e6,
+            max_seq_len: int = 8192,# Context Window限制模型一次性输入的最大Token个数 
+            rope_theta: int = 1e6,  # 采用RoPE旋转位置编码(rope_theta很大,说明model支持长文本)
             dropout: float = 0.0,
             flash_attn: bool = True,
             ####################################################
